@@ -1,0 +1,5 @@
+{
+  "name": "Judicial Timeline Report",
+  "description": "An interactive web application that visualizes the chronological sequence of alleged constitutional and statutory violations in Case No. 3:24-cv-00579-ART-CSD, tailored for judicial review.",
+  "requestFramePermissions": []
+}
