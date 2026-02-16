@@ -1,7 +1,9 @@
-
 import React, { useState, useRef } from 'react';
-import { GoogleGenAI, Type } from "@google/genai";
+import { Type } from "@google/genai";
+import { MASTER_SYSTEM_PROMPT } from '../ai-config';
 import type { TimelineEvent, Document } from '../types';
+import { aiClient } from '../ai-client';
+import { safeParseJSON } from '../utils';
 
 interface EvidenceInputProps {
   onAddEvents: (events: TimelineEvent[]) => void;
@@ -18,6 +20,19 @@ interface DocIdentity {
     summary: string;
 }
 
+interface ExtractionResult {
+    events: TimelineEvent[];
+    fullText: string;
+}
+
+interface BatchReport {
+    processed: number;
+    added: number;
+    skippedExact: number;
+    skippedSemantic: number;
+    failed: number;
+}
+
 const EvidenceInput: React.FC<EvidenceInputProps> = ({ onAddEvents, onAddDocument, documents }) => {
   const [inputText, setInputText] = useState('');
   const [isProcessing, setIsProcessing] = useState(false);
@@ -25,29 +40,29 @@ const EvidenceInput: React.FC<EvidenceInputProps> = ({ onAddEvents, onAddDocumen
   const [parsedDrafts, setParsedDrafts] = useState<TimelineEvent[]>([]);
   const [mode, setMode] = useState<'input' | 'review'>('input');
   
-  // State for duplicate summary instead of blocking modal
-  const [duplicateSummary, setDuplicateSummary] = useState<Array<{filename: string, match: string}>>([]);
+  // Resolution State
+  const [resolutionInputs, setResolutionInputs] = useState<{[key: number]: string}>({});
+  const [resolvingIndex, setResolvingIndex] = useState<number | null>(null);
+
+  const [duplicateSummary, setDuplicateSummary] = useState<Array<{filename: string, match: string, type: 'Exact' | 'Semantic'}>>([]);
+  const [batchReport, setBatchReport] = useState<BatchReport | null>(null);
   
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  // Initialize Gemini
-  const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+  // --- Helpers ---
 
-  // SHA-256 Hash for Chain of Custody
   const computeHash = async (base64: string): Promise<string> => {
-      const msgBuffer = new TextEncoder().encode(base64);
+      const msgBuffer = new TextEncoder().encode(base64.slice(0, 1000000)); // Hash first 1MB for speed on large AV files
       const hashBuffer = await crypto.subtle.digest('SHA-256', msgBuffer);
       const hashArray = Array.from(new Uint8Array(hashBuffer));
-      const hashHex = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
-      return hashHex;
+      return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
   };
 
   const simpleHash = (str: string) => {
     let hash = 0;
     for (let i = 0; i < str.length; i++) {
-        const char = str.charCodeAt(i);
-        hash = (hash << 5) - hash + char;
-        hash = hash & hash; // Convert to 32bit integer
+        hash = ((hash << 5) - hash) + str.charCodeAt(i);
+        hash |= 0;
     }
     return hash;
   };
@@ -55,111 +70,144 @@ const EvidenceInput: React.FC<EvidenceInputProps> = ({ onAddEvents, onAddDocumen
   const readFileAsBase64 = (file: File): Promise<string> => {
     return new Promise((resolve, reject) => {
       const reader = new FileReader();
-      reader.onload = () => {
-        const result = reader.result as string;
-        // Remove Data URL prefix to get raw base64
-        resolve((result.split(',')[1]));
-      };
+      reader.onload = () => resolve((reader.result as string).split(',')[1]);
       reader.onerror = reject;
       reader.readAsDataURL(file);
     });
   };
+
+  const encodeBase64 = (str: string) => {
+    return btoa(encodeURIComponent(str).replace(/%([0-9A-F]{2})/g,
+        function toSolidBytes(match, p1) {
+            return String.fromCharCode(parseInt(p1, 16));
+    }));
+  };
+
+  // --- Handlers ---
 
   const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = e.target.files;
     if (!files || files.length === 0) return;
 
     setIsProcessing(true);
-    setDuplicateSummary([]); // Clear previous summary
-    const newDrafts: TimelineEvent[] = [];
-    const duplicatesFound: Array<{filename: string, match: string}> = [];
-    const currentBatchHashes = new Set<number>();
-    const currentBatchTitles = new Set<string>();
+    setDuplicateSummary([]);
+    setBatchReport(null);
 
-    // Process files sequentially to maintain order and update UI
+    const newDrafts: TimelineEvent[] = [];
+    const duplicatesFound: Array<{filename: string, match: string, type: 'Exact' | 'Semantic'}> = [];
+    
+    const currentBatchHashes = new Set<string>();
+    const currentBatchTitles = new Set<string>();
+    
+    let skippedExact = 0;
+    let skippedSemantic = 0;
+    let addedCount = 0;
+    let failedCount = 0;
+
     for (let i = 0; i < files.length; i++) {
         const file = files[i];
-        setStatusMessage(`Forensics: Analyzing file ${i + 1} of ${files.length}: ${file.name}...`);
+        if (file.size > 20 * 1024 * 1024) {
+             console.warn(`File ${file.name} is too large (>20MB). Skipping.`);
+             failedCount++;
+             continue;
+        }
+
+        setStatusMessage(`Analyzing file ${i + 1} of ${files.length}: ${file.name}...`);
         
         try {
             const base64Data = await readFileAsBase64(file);
-            const newDocHash = simpleHash(base64Data);
             const sha256 = await computeHash(base64Data);
 
-            // 1. Strict Hash Check (Global & Batch)
-            const globalExactMatch = documents.find(d => simpleHash(d.content) === newDocHash);
-            const batchExactMatch = currentBatchHashes.has(newDocHash);
-
-            if (globalExactMatch || batchExactMatch) {
-                duplicatesFound.push({
-                    filename: file.name,
-                    match: globalExactMatch?.title || "Duplicate in current batch"
-                });
-                continue; // Skip processing
-            }
-
-            // 2. AI Identity Check (Semantic)
-            // We pass existing docs + titles found in this current batch to avoid adding same thing twice in one go
-            const identity = await analyzeDocumentIdentity(base64Data, file.type, currentBatchTitles);
-            
-            if (identity.isDuplicate) {
-                 duplicatesFound.push({
-                    filename: file.name,
-                    match: identity.duplicateOf || "Existing Record"
-                });
+            const globalExactMatch = documents.find(d => d.hash === sha256);
+            if (globalExactMatch) {
+                duplicatesFound.push({ filename: file.name, match: globalExactMatch.title, type: 'Exact' });
+                skippedExact++;
                 continue;
             }
 
-            // Generate a stable ID for the document *before* processing events
+            const isMedia = file.type.startsWith('audio/') || file.type.startsWith('video/');
+            const mediaType = file.type.startsWith('audio/') ? 'audio' : file.type.startsWith('video/') ? 'video' : file.type.includes('pdf') ? 'pdf' : 'text';
+
+            let identity: DocIdentity;
+            let events: TimelineEvent[] = [];
+            let content = '';
             const docId = `doc-${Date.now()}-${i}`;
 
-            // 3. Valid New Document - Process it
-            // CRITICAL: We pass the docId so the generated events link to this ID, not just the name.
-            const events = await processEvidenceWithAI(base64Data, file.type, docId);
+            if (isMedia) {
+                setStatusMessage(`Transcribing & Profiling Media: ${file.name}...`);
+                const result = await processMediaWithAI(base64Data, file.type, docId, currentBatchTitles);
+                identity = result.identity;
+                
+                if (identity.isDuplicate) {
+                     duplicatesFound.push({ filename: file.name, match: identity.duplicateOf || "Existing Record", type: 'Semantic' });
+                     skippedSemantic++;
+                     continue;
+                }
+                events = result.events;
+                content = result.transcript;
+            } else {
+                identity = await analyzeDocumentIdentity(base64Data, file.type, currentBatchTitles);
+                
+                if (identity.isDuplicate) {
+                     duplicatesFound.push({ filename: file.name, match: identity.duplicateOf || "Existing Record", type: 'Semantic' });
+                     skippedSemantic++;
+                     continue;
+                }
+                
+                setStatusMessage(`Extracting Events & OCR: ${identity.title || file.name}...`);
+                const result = await processEvidenceWithAI(base64Data, file.type, docId);
+                events = result.events;
+                content = result.fullText || identity.summary || 'Content processed by AI';
+            }
+
             newDrafts.push(...events);
 
-            // Add Document immediately to store
             onAddDocument({
                 id: docId,
                 title: identity.title || file.name,
-                content: `[Processed Content] ${identity.summary || 'Content processed by AI'}`,
+                content: content,
+                mediaType: mediaType as any,
+                mediaData: isMedia ? `data:${file.type};base64,${base64Data}` : undefined,
                 date: identity.date,
-                type: file.type.includes('pdf') ? 'pdf' : 'text',
                 hash: sha256,
-                addedAt: new Date().toISOString()
+                addedAt: new Date().toISOString(),
+                reliabilityScore: 100
             });
 
-            // Track for next iteration
-            currentBatchHashes.add(newDocHash);
+            currentBatchHashes.add(sha256);
             if (identity.title) currentBatchTitles.add(identity.title);
+            addedCount++;
 
         } catch (error) {
             console.error(`Error processing ${file.name}:`, error);
-            // Optionally add to an error summary, for now just log
+            failedCount++;
         }
     }
 
     setParsedDrafts(prev => [...prev, ...newDrafts]);
-    if (duplicatesFound.length > 0) {
-        setDuplicateSummary(duplicatesFound);
-    }
+    if (duplicatesFound.length > 0) setDuplicateSummary(duplicatesFound);
+    
+    setBatchReport({
+        processed: files.length,
+        added: addedCount,
+        skippedExact,
+        skippedSemantic,
+        failed: failedCount
+    });
 
     setIsProcessing(false);
     setStatusMessage('');
     setMode('review');
-    
-    // Reset input
     if (fileInputRef.current) fileInputRef.current.value = '';
   };
 
   const analyzeDocumentIdentity = async (data: string, mimeType: string, batchTitles: Set<string>): Promise<DocIdentity> => {
-    // Combine existing docs and current batch titles for checking
     const existingDocList = documents.map(d => `Title: "${d.title}", Date: ${d.date || 'Unknown'}`).join('\n');
     const batchList = Array.from(batchTitles).map(t => `Title: "${t}" (Processing)`).join('\n');
 
     const prompt = `
         Analyze this document. 
-        1. Determine its official Title (e.g., "Arrest Report", "Motion to Dismiss").
+        1. Determine its official Title (e.g., "Arrest Report").
         2. Extract the Document Date (YYYY-MM-DD).
         3. Summarize it in one sentence.
         4. Compare it against this list of existing documents:
@@ -167,112 +215,160 @@ const EvidenceInput: React.FC<EvidenceInputProps> = ({ onAddEvents, onAddDocumen
         ${existingDocList}
         ${batchList}
         ---
-        If this document seems to be the same as one in the list (even if the filename is different), set isDuplicate to true and 'duplicateOf' to the existing title.
+        If this document seems to be the same as one in the list (even if the filename is different), set isDuplicate to true.
+        
+        DATA CONTEXT:
+        MimeType: ${mimeType}
+        Content (Base64 Truncated): ${data.substring(0, 200)}...
     `;
 
-    const response = await ai.models.generateContent({
-        model: 'gemini-3-pro-preview',
-        contents: [
-            {
-                role: 'user',
-                parts: [
-                    { text: prompt },
-                    { inlineData: { mimeType: mimeType, data: data } }
-                ]
-            }
-        ],
-        config: {
-            responseMimeType: "application/json",
-            responseSchema: {
-                type: Type.OBJECT,
-                properties: {
-                    title: { type: Type.STRING },
-                    date: { type: Type.STRING },
-                    type: { type: Type.STRING },
-                    summary: { type: Type.STRING },
-                    isDuplicate: { type: Type.BOOLEAN },
-                    duplicateOf: { type: Type.STRING }
-                }
+    return await aiClient.generateJSON({
+        systemPrompt: MASTER_SYSTEM_PROMPT,
+        userPrompt: prompt,
+        jsonMode: true,
+        schema: {
+            type: Type.OBJECT,
+            properties: {
+                title: { type: Type.STRING },
+                date: { type: Type.STRING },
+                type: { type: Type.STRING },
+                summary: { type: Type.STRING },
+                isDuplicate: { type: Type.BOOLEAN },
+                duplicateOf: { type: Type.STRING }
             }
         }
     });
-
-    return JSON.parse(response.text || '{}');
   };
 
-  const processEvidenceWithAI = async (data: string, mimeType: string, sourceId: string): Promise<TimelineEvent[]> => {
-    // Removed setStatusMessage here to allow loop to control message
+  const processMediaWithAI = async (data: string, mimeType: string, sourceId: string, batchTitles: Set<string>): Promise<{identity: DocIdentity, events: TimelineEvent[], transcript: string}> => {
+     try {
+        const existingDocList = documents.map(d => `Title: "${d.title}", Date: ${d.date || 'Unknown'}`).join('\n');
+        const batchList = Array.from(batchTitles).map(t => `Title: "${t}" (Processing)`).join('\n');
+
+        // Note: For media files, we stick to Gemini exclusively as it handles multimodal.
+        // The unified client will use Gemini if data is media, or throw error if forced to OpenAI (which doesn't support direct audio/video bytes easily in this setup)
+        // Since we are sending base64, we bypass the UnifiedClient for this specific call to ensure we use the correct Gemini method that accepts InlineData.
+        
+        // However, UnifiedClient abstracts text generation. We need to instantiate Gemini manually for media upload
+        // OR we just use the UnifiedClient's internal logic if updated. 
+        // For SAFETY in this "stress test" update, let's keep media handling direct to GoogleGenAI but use the key management.
+        // Wait, UnifiedClient doesn't support inlineData yet. Let's fix that in ai-client or just use direct here.
+        // Direct approach for Media is safer for now.
+
+        const prompt = `
+            You are a Forensic Audio/Video Analyst.
+            TASK 1: Generate a verbatim TRANSCRIPT.
+            TASK 2: Extract Timeline Events.
+            TASK 3: Create Metadata.
+            EXISTING DOCS: ${existingDocList} ${batchList}
+        `;
+        
+        // DIRECT GEMINI CALL FOR MEDIA (Unified Client doesn't support multimodal base64 yet)
+        const { GoogleGenAI } = await import("@google/genai");
+        const ai = new GoogleGenAI({ apiKey: process.env.API_KEY }); 
+        
+        const response = await ai.models.generateContent({
+            model: 'gemini-3-pro-preview', 
+            contents: [{ role: 'user', parts: [{ text: prompt }, { inlineData: { mimeType: mimeType, data: data } }] }],
+            config: {
+                systemInstruction: MASTER_SYSTEM_PROMPT,
+                responseMimeType: "application/json"
+            }
+        });
+
+        const result = safeParseJSON(response.text || '{}');
+        
+        const enrichedEvents = (result.events || []).map((ev: any) => ({
+            ...ev,
+            id: `media-event-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+            sourceId: sourceId,
+            snippetAnchor: ev.sourceCitation, // Use timestamp as anchor
+            needsClarification: !ev.date
+        }));
+
+        return {
+            identity: result.identity,
+            events: enrichedEvents,
+            transcript: result.transcript
+        };
+
+     } catch (err) {
+        console.error("AI Media Processing Error:", err);
+        throw err;
+     }
+  };
+
+  const processEvidenceWithAI = async (data: string, mimeType: string, sourceId: string): Promise<ExtractionResult> => {
     try {
-      const model = ai.models;
-      
       const prompt = `
-        You are a forensic legal analyst for the case State v. Church (CR23-0657).
-        Your job is to extract a strictly chronological timeline of events from the provided evidence.
+        You are a Forensic Evidence Parser.
+        Convert raw documents into structured timeline events for Case No. 3:24-cv-00579.
         
-        CRITICAL RULES:
-        1. Extract specific dates for every event. If a date is ambiguous (e.g., "last Tuesday"), mark 'needsClarification' as true and write a 'clarificationQuestion' asking the user to specify the date.
-        2. Identify the 'Cause' (State action/omission) and 'Effect' (Injury to defendant).
-        3. Identify specific Constitutional or Statutory violations (Claims).
-        4. Identify the Relief sought or available remedies.
-        5. EXTRACT LEGAL SIGNIFICANCE: Why does this event matter for a § 1983 or Habeas claim?
-        6. EXTRACT CITATIONS: If the document cites specific statutes (NRS), case law, or constitutional amendments, list them.
-        7. EXTRACT SOURCE CITATION: Identify the exact phrase or sentence in the text that proves this event occurred. This will be used for highlighting.
-        
-        Return a JSON array of event objects.
+        DOC CONTENT (${mimeType}):
+        ${data.substring(0, 1000)}... (Content truncated for prompt log, full content used in processing)
       `;
 
-      const response = await model.generateContent({
+      // For Text/PDF, we can use the Unified Client if we pass text. 
+      // But we are passing base64. 
+      // Similar to media, let's use direct Gemini for the base64 handling capability, 
+      // BUT if we were using OpenAI, we'd need to extract text first.
+      // For this "Foolproof" version, we assume Gemini is best for PDF ingestion.
+      
+      const { GoogleGenAI } = await import("@google/genai");
+      const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+      
+      const response = await ai.models.generateContent({
         model: 'gemini-3-pro-preview',
-        contents: [
-          {
-            role: 'user',
-            parts: [
-              { text: prompt },
-              { inlineData: { mimeType: mimeType, data: data } }
-            ]
-          }
-        ],
+        contents: [{ role: 'user', parts: [{ text: prompt }, { inlineData: { mimeType: mimeType, data: data } }] }],
         config: {
+          systemInstruction: MASTER_SYSTEM_PROMPT,
           responseMimeType: "application/json",
           responseSchema: {
-            type: Type.ARRAY,
-            items: {
-              type: Type.OBJECT,
-              properties: {
-                date: { type: Type.STRING, description: "YYYY-MM-DD or empty if unknown" },
-                title: { type: Type.STRING },
-                cause: { type: Type.STRING },
-                effect: { type: Type.STRING },
-                claim: { type: Type.STRING },
-                relief: { type: Type.STRING },
-                legalSignificance: { type: Type.STRING, description: "Analysis of why this event is actionable"},
-                citations: { type: Type.ARRAY, items: { type: Type.STRING }, description: "List of statutes or case law cited" },
-                sourceCitation: { type: Type.STRING, description: "Direct quote or reference from text" },
-                needsClarification: { type: Type.BOOLEAN },
-                clarificationQuestion: { type: Type.STRING },
+            type: Type.OBJECT,
+            properties: {
+              events: {
+                type: Type.ARRAY,
+                items: {
+                  type: Type.OBJECT,
+                  properties: {
+                    date: { type: Type.STRING },
+                    title: { type: Type.STRING },
+                    actor: { type: Type.STRING },
+                    cause: { type: Type.STRING },
+                    effect: { type: Type.STRING },
+                    claim: { type: Type.STRING },
+                    legalSignificance: { type: Type.STRING },
+                    caseReference: { type: Type.STRING },
+                    sourceCitation: { type: Type.STRING },
+                    clarificationQuestion: { type: Type.STRING },
+                    needsClarification: { type: Type.BOOLEAN },
+                  },
+                  required: ["title", "actor", "cause", "effect", "sourceCitation"]
+                }
               },
-              required: ["title", "cause", "effect", "claim"]
+              fullText: { type: Type.STRING }
             }
           }
         }
       });
 
-      const events = JSON.parse(response.text || '[]');
-      
-      // Add IDs and Source refs
-      const enrichedEvents = events.map((ev: any, idx: number) => ({
+      const result = safeParseJSON(response.text || '{}');
+      const events = (result.events || []).map((ev: any) => ({
         ...ev,
         id: `extracted-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
-        sourceId: sourceId, // Link to the Document ID
-        confidence: 'high'
+        sourceId: sourceId,
+        snippetAnchor: ev.sourceCitation ? simpleHash(ev.sourceCitation).toString() : undefined,
+        needsClarification: !!ev.clarificationQuestion || !ev.date
       }));
 
-      return enrichedEvents;
+      return {
+          events,
+          fullText: result.fullText || ""
+      };
 
     } catch (err) {
       console.error("AI Processing Error:", err);
-      // Return empty array on error to allow other files to proceed
-      return [];
+      return { events: [], fullText: "Error processing document text." };
     }
   };
 
@@ -280,44 +376,160 @@ const EvidenceInput: React.FC<EvidenceInputProps> = ({ onAddEvents, onAddDocumen
     if (!inputText.trim()) return;
     setIsProcessing(true);
     setStatusMessage('Analyzing Text...');
-    setDuplicateSummary([]);
+    
+    const virtualDocId = `manual-text-${Date.now()}`;
+    
+    try {
+        // Use Unified Client for pure text analysis (Reliable & Switchable)
+        const prompt = `
+            Analyze this legal text. Extract timeline events.
+            TEXT:
+            ${inputText}
+            
+            OUTPUT SCHEMA: { events: [ ... ], fullText: "..." }
+        `;
+        
+        const result = await aiClient.generateJSON({
+            systemPrompt: MASTER_SYSTEM_PROMPT,
+            userPrompt: prompt,
+            jsonMode: true,
+            schema: {
+                type: Type.OBJECT,
+                properties: {
+                  events: {
+                    type: Type.ARRAY,
+                    items: {
+                      type: Type.OBJECT,
+                      properties: {
+                        date: { type: Type.STRING },
+                        title: { type: Type.STRING },
+                        actor: { type: Type.STRING },
+                        cause: { type: Type.STRING },
+                        effect: { type: Type.STRING },
+                        claim: { type: Type.STRING },
+                        legalSignificance: { type: Type.STRING },
+                        caseReference: { type: Type.STRING },
+                        sourceCitation: { type: Type.STRING },
+                        clarificationQuestion: { type: Type.STRING },
+                        needsClarification: { type: Type.BOOLEAN },
+                      }
+                    }
+                  },
+                  fullText: { type: Type.STRING }
+                }
+            }
+        });
 
-    const base64 = btoa(inputText); 
-    
-    // For manual text, we skip complex dup check for now
-    const events = await processEvidenceWithAI(base64, 'text/plain', 'manual-text-entry');
-    
-    setParsedDrafts(prev => [...prev, ...events]);
-    setIsProcessing(false);
-    setStatusMessage('');
-    setMode('review');
+        // Add the manual text as a document so it appears in the Vault
+        const base64 = encodeBase64(inputText);
+        onAddDocument({
+            id: virtualDocId,
+            title: "Manual Text Entry",
+            content: inputText,
+            mediaType: 'text',
+            date: new Date().toISOString().split('T')[0],
+            hash: await computeHash(base64),
+            addedAt: new Date().toISOString(),
+            reliabilityScore: 100
+        });
+
+        const events = (result.events || []).map((ev: any) => ({
+            ...ev,
+            id: `text-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+            sourceId: virtualDocId,
+            needsClarification: !!ev.clarificationQuestion || !ev.date
+        }));
+
+        setParsedDrafts(prev => [...prev, ...events]);
+        setMode('review');
+    } catch (e) {
+        console.error(e);
+        setStatusMessage('Analysis failed. Try again.');
+    } finally {
+        setIsProcessing(false);
+    }
+  };
+
+  const resolveClarification = async (index: number) => {
+      const input = resolutionInputs[index];
+      if (!input) return;
+
+      setResolvingIndex(index);
+      
+      try {
+          const draft = parsedDrafts[index];
+          const prompt = `
+            FLAGGED EVENT: ${JSON.stringify(draft)}
+            USER CLARIFICATION: "${input}"
+            TASK: Fix the event JSON based on user input. Remove 'needsClarification'.
+          `;
+
+          const corrected = await aiClient.generateJSON({
+              systemPrompt: MASTER_SYSTEM_PROMPT,
+              userPrompt: prompt,
+              jsonMode: true,
+              schema: {
+                  type: Type.OBJECT,
+                  properties: {
+                        date: { type: Type.STRING },
+                        title: { type: Type.STRING },
+                        actor: { type: Type.STRING },
+                        cause: { type: Type.STRING },
+                        effect: { type: Type.STRING },
+                        claim: { type: Type.STRING },
+                        legalSignificance: { type: Type.STRING },
+                        caseReference: { type: Type.STRING },
+                        sourceCitation: { type: Type.STRING },
+                        clarificationQuestion: { type: Type.STRING },
+                        needsClarification: { type: Type.BOOLEAN },
+                  }
+              }
+          });
+          
+          if (corrected.title === "DELETED_EVENT") {
+             const updated = [...parsedDrafts];
+             updated.splice(index, 1);
+             setParsedDrafts(updated);
+          } else {
+             const updated = [...parsedDrafts];
+             updated[index] = { ...draft, ...corrected, id: draft.id };
+             setParsedDrafts(updated);
+          }
+          
+          setResolutionInputs(prev => {
+              const next = {...prev};
+              delete next[index];
+              return next;
+          });
+
+      } catch (e) {
+          console.error("Resolution failed", e);
+          alert("Could not interpret resolution. Please edit manually.");
+      } finally {
+          setResolvingIndex(null);
+      }
   };
 
   const handleUpdateDraft = (index: number, field: keyof TimelineEvent, value: any) => {
     const updated = [...parsedDrafts];
     updated[index] = { ...updated[index], [field]: value };
-    
-    // Auto-resolve clarification if date is fixed
     if (field === 'date' && value.match(/\d{4}-\d{2}-\d{2}/)) {
         updated[index].needsClarification = false;
         updated[index].clarificationQuestion = undefined;
     }
-
     setParsedDrafts(updated);
   };
 
   const handleCommit = () => {
-    const validEvents = parsedDrafts.filter(d => !d.needsClarification && d.date);
-    if (validEvents.length !== parsedDrafts.length) {
-      alert("Please answer all clarification questions before committing.");
-      return;
-    }
-    onAddEvents(validEvents);
+    onAddEvents(parsedDrafts.filter(d => !d.needsClarification));
     setParsedDrafts([]);
     setInputText('');
     setDuplicateSummary([]);
+    setBatchReport(null);
     setMode('input');
   };
+
+  const hasPendingClarifications = parsedDrafts.some(d => d.needsClarification);
 
   return (
     <div className="bg-gray-800/50 p-6 md:p-8 rounded-lg border border-gray-700 shadow-lg animate-fade-in relative">
@@ -326,77 +538,60 @@ const EvidenceInput: React.FC<EvidenceInputProps> = ({ onAddEvents, onAddDocumen
             <h2 className="text-3xl font-bold font-serif text-gray-100 flex items-center">
             Evidence Command Center
             {isProcessing && <span className="ml-4 text-sm font-sans text-yellow-400 animate-pulse flex items-center">
-                <svg className="animate-spin -ml-1 mr-2 h-4 w-4 text-yellow-400" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg>
-                {statusMessage || 'Processing...'}
+                {statusMessage}
             </span>}
             </h2>
-            <p className="text-gray-400 mt-2">
-            Upload multiple PDF filings, transcripts, or paste text. The AI will forensically extract timeline events and flag ambiguities.
-            </p>
+            <p className="text-gray-400 mt-2">Upload filings, transcripts, or <strong className="text-white">Audio/Video Recordings</strong>. AI extracts forensic timeline events.</p>
         </div>
         <div className="text-right">
             <span className="block text-2xl font-bold text-white">{documents.length}</span>
-            <span className="text-xs text-gray-500 uppercase tracking-wider">Total Items in Locker</span>
+            <span className="text-xs text-gray-500 uppercase tracking-wider">Locker Items</span>
         </div>
       </div>
 
       {mode === 'input' ? (
         <div className="space-y-6">
-          
-          {/* Quick List of Existing Documents */}
-          <div className="bg-gray-900/50 rounded-lg p-4 max-h-32 overflow-y-auto border border-gray-700">
-             <h4 className="text-xs font-bold text-gray-500 uppercase mb-2 sticky top-0 bg-gray-900/90 backdrop-blur-sm py-1">Items currently on record:</h4>
-             <div className="flex flex-wrap gap-2">
-                 {documents.map(d => (
-                     <span key={d.id} className="text-xs px-2 py-1 bg-gray-800 border border-gray-600 rounded text-gray-300">
-                         {d.title}
-                     </span>
-                 ))}
-             </div>
-          </div>
-
-          {/* File Upload Area */}
-          <div className="border-2 border-dashed border-gray-600 rounded-lg p-8 text-center hover:border-yellow-500 transition-colors bg-gray-900/50">
+          <div className="border-2 border-dashed border-gray-600 rounded-lg p-8 text-center bg-gray-900/50 hover:bg-gray-800 transition-colors">
             <input 
               type="file" 
               ref={fileInputRef}
               onChange={handleFileUpload}
               className="hidden" 
-              accept=".pdf,.txt,image/*"
-              multiple // Allow bulk upload
+              accept=".pdf,.txt,image/*,audio/*,video/*"
+              multiple 
+            />
+            <div className="flex flex-col items-center gap-2">
+                <svg className="w-12 h-12 text-gray-500 mb-2" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1} d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" /></svg>
+                <button 
+                onClick={() => fileInputRef.current?.click()}
+                className="bg-yellow-500 text-gray-900 font-bold py-3 px-8 rounded-full hover:bg-yellow-400 shadow-lg transition-transform hover:scale-105"
+                >
+                Upload Evidence (Batch)
+                </button>
+                <p className="text-xs text-gray-500 mt-2">Supports: PDF, IMG, MP3, WAV, MP4 (Max 20MB per file)</p>
+            </div>
+          </div>
+          <div className="relative">
+              <div className="absolute inset-0 flex items-center" aria-hidden="true">
+                <div className="w-full border-t border-gray-700"></div>
+              </div>
+              <div className="relative flex justify-center">
+                <span className="px-2 bg-gray-900 text-gray-500 text-sm">OR PASTE TEXT</span>
+              </div>
+          </div>
+          <div className="relative">
+            <textarea
+                className="w-full h-32 bg-gray-900 border border-gray-700 rounded-md p-4 text-gray-300 font-mono text-sm focus:border-yellow-500 outline-none transition-colors"
+                placeholder="Paste legal text, emails, or docket entries here..."
+                value={inputText}
+                onChange={(e) => setInputText(e.target.value)}
             />
             <button 
-              onClick={() => fileInputRef.current?.click()}
-              className="bg-yellow-500/10 text-yellow-400 font-bold py-2 px-6 rounded-full hover:bg-yellow-500/20 mb-2"
+                onClick={handleTextAnalyze} 
+                disabled={!inputText.trim() || isProcessing} 
+                className="absolute bottom-4 right-4 bg-gray-700 hover:bg-gray-600 text-white px-4 py-1 rounded text-xs font-bold transition-colors disabled:opacity-50"
             >
-              Upload Files (Bulk Supported)
-            </button>
-            <p className="text-xs text-gray-500">Supported: PDF, JPG, PNG, TXT</p>
-          </div>
-
-          <div className="relative">
-            <div className="absolute inset-0 flex items-center">
-              <div className="w-full border-t border-gray-700"></div>
-            </div>
-            <div className="relative flex justify-center text-sm">
-              <span className="px-2 bg-gray-800 text-gray-500">Or paste text</span>
-            </div>
-          </div>
-
-          <textarea
-            className="w-full h-48 bg-gray-900 border border-gray-700 rounded-md p-4 text-gray-300 font-mono text-sm focus:ring-2 focus:ring-yellow-500 focus:border-transparent outline-none"
-            placeholder="Paste raw text here..."
-            value={inputText}
-            onChange={(e) => setInputText(e.target.value)}
-          />
-          
-          <div className="flex justify-end">
-             <button
-              onClick={handleTextAnalyze}
-              disabled={!inputText.trim() || isProcessing}
-              className="bg-gray-700 text-white px-6 py-2 rounded-md font-bold hover:bg-gray-600 disabled:opacity-50 transition-colors"
-            >
-              Process Text
+                Process Text
             </button>
           </div>
         </div>
@@ -404,143 +599,77 @@ const EvidenceInput: React.FC<EvidenceInputProps> = ({ onAddEvents, onAddDocumen
         <div className="space-y-6">
           <div className="flex justify-between items-center">
             <h3 className="text-xl font-semibold text-yellow-400">Forensic Review</h3>
-            <button 
-              onClick={() => {
-                setMode('input');
-                setParsedDrafts([]);
-                setDuplicateSummary([]);
-              }}
-              className="text-sm text-gray-400 hover:text-white underline"
-            >
-              Discard & Cancel
-            </button>
+            <button onClick={() => { setMode('input'); setParsedDrafts([]); }} className="text-sm text-gray-400 underline hover:text-white">Discard All</button>
           </div>
 
-          {/* Duplicate Summary Report */}
-          {duplicateSummary.length > 0 && (
-             <div className="bg-yellow-500/10 border border-yellow-500/50 rounded-lg p-4 mb-4 animate-fade-in">
-                <div className="flex items-start">
-                    <svg className="w-5 h-5 text-yellow-500 mr-2 mt-0.5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" /></svg>
-                    <div>
-                        <h4 className="text-yellow-400 font-bold text-sm">Duplicates Skipped ({duplicateSummary.length})</h4>
-                        <p className="text-gray-400 text-xs mb-2">The following files were identified as duplicates and were not processed:</p>
-                        <ul className="text-xs space-y-1">
-                            {duplicateSummary.map((d, i) => (
-                                <li key={i} className="flex gap-2">
-                                    <span className="text-gray-300 font-mono">{d.filename}</span>
-                                    <span className="text-gray-500">→ matches {d.match}</span>
-                                </li>
-                            ))}
-                        </ul>
-                    </div>
-                </div>
+          {batchReport && (
+             <div className="bg-blue-900/20 border border-blue-500/30 p-4 rounded text-sm grid grid-cols-5 gap-4 text-center">
+                 <div><div className="text-2xl font-bold text-white">{batchReport.processed}</div><div className="text-gray-400 text-xs">Files Processed</div></div>
+                 <div><div className="text-2xl font-bold text-green-400">{batchReport.added}</div><div className="text-gray-400 text-xs">Added</div></div>
+                 <div><div className="text-2xl font-bold text-yellow-500">{batchReport.skippedExact}</div><div className="text-gray-400 text-xs">Exact Duplicates</div></div>
+                 <div><div className="text-2xl font-bold text-orange-500">{batchReport.skippedSemantic}</div><div className="text-gray-400 text-xs">Semantic Duplicates</div></div>
+                 <div><div className="text-2xl font-bold text-red-500">{batchReport.failed}</div><div className="text-gray-400 text-xs">Failed</div></div>
              </div>
           )}
 
-          {parsedDrafts.length === 0 && duplicateSummary.length === 0 ? (
-            <p className="text-gray-400 italic">No valid events found to import.</p>
-          ) : (
-            <div className="space-y-4">
+          {parsedDrafts.length === 0 ? <p className="text-gray-400 italic">No new events found.</p> : (
+            <div className="space-y-4 max-h-[500px] overflow-y-auto pr-2">
             {parsedDrafts.map((draft, idx) => (
               <div key={idx} className={`p-4 rounded-lg border ${draft.needsClarification ? 'border-red-500 bg-red-900/10' : 'border-green-500/30 bg-gray-800'}`}>
-                
                 {draft.needsClarification && (
-                  <div className="mb-4 bg-red-900/20 p-3 rounded border border-red-500/50 flex flex-col md:flex-row md:items-center gap-3">
-                    <span className="text-red-400 font-bold whitespace-nowrap">Clarification Needed:</span>
-                    <span className="text-red-200 text-sm flex-1">{draft.clarificationQuestion || "Please verify the date for this event."}</span>
+                  <div className="mb-4 bg-red-900/20 p-4 rounded border border-red-500/50">
+                    <div className="flex items-start gap-3 mb-3">
+                        <span className="text-red-400 font-bold whitespace-nowrap">Clarification Needed:</span>
+                        <span className="text-red-200 text-sm italic">"{draft.clarificationQuestion || "Verify Date/Details"}"</span>
+                    </div>
+                    
+                    {/* Resolution Console */}
+                    <div className="flex gap-2">
+                         <div className="relative flex-1">
+                             <input 
+                                type="text"
+                                placeholder="Type answer to fix (e.g. 'The date is Jan 5th')..."
+                                className="w-full bg-black border border-red-700 rounded p-2 text-white text-sm pl-8 focus:ring-1 focus:ring-red-500 outline-none"
+                                value={resolutionInputs[idx] || ''}
+                                onChange={(e) => setResolutionInputs(prev => ({...prev, [idx]: e.target.value}))}
+                                onKeyDown={(e) => e.key === 'Enter' && resolveClarification(idx)}
+                             />
+                             <span className="absolute left-2 top-2 text-red-500">▶</span>
+                         </div>
+                         <button
+                            onClick={() => resolveClarification(idx)}
+                            disabled={resolvingIndex === idx || !resolutionInputs[idx]}
+                            className="bg-red-700 hover:bg-red-600 text-white px-4 py-2 rounded text-xs font-bold uppercase disabled:opacity-50 flex items-center gap-2"
+                         >
+                            {resolvingIndex === idx ? <span className="animate-spin">⟳</span> : <span>AUTO-FIX</span>}
+                         </button>
+                    </div>
                   </div>
                 )}
-
-                {/* Source Badge */}
-                <div className="mb-2">
-                    <span className="text-[10px] bg-gray-700 text-gray-300 px-2 py-0.5 rounded border border-gray-600">
-                        Source ID: {draft.sourceId}
-                    </span>
-                </div>
-                
-                <div className="grid grid-cols-1 md:grid-cols-12 gap-4">
-                  <div className="md:col-span-3">
-                    <label className="block text-[10px] text-gray-500 uppercase tracking-wider mb-1">Date</label>
-                    <input 
-                      type="text" 
-                      value={draft.date} 
-                      onChange={(e) => handleUpdateDraft(idx, 'date', e.target.value)}
-                      className={`w-full bg-gray-900 border ${draft.needsClarification && !draft.date ? 'border-red-500' : 'border-gray-700'} rounded px-3 py-2 text-sm text-white font-mono`}
-                      placeholder="YYYY-MM-DD"
-                    />
-                  </div>
-                  <div className="md:col-span-9">
-                    <label className="block text-[10px] text-gray-500 uppercase tracking-wider mb-1">Event Title</label>
-                    <input 
-                      type="text" 
-                      value={draft.title} 
-                      onChange={(e) => handleUpdateDraft(idx, 'title', e.target.value)}
-                      className="w-full bg-gray-900 border border-gray-700 rounded px-3 py-2 text-sm text-white font-bold"
-                    />
-                  </div>
-                  
-                  <div className="md:col-span-6">
-                    <label className="block text-[10px] text-gray-500 uppercase tracking-wider mb-1">Cause (State Action)</label>
-                    <textarea 
-                      value={draft.cause} 
-                      rows={2}
-                      onChange={(e) => handleUpdateDraft(idx, 'cause', e.target.value)}
-                      className="w-full bg-gray-900 border border-gray-700 rounded px-3 py-2 text-sm text-gray-300"
-                    />
-                  </div>
-                  <div className="md:col-span-6">
-                     <label className="block text-[10px] text-gray-500 uppercase tracking-wider mb-1">Effect (Injury)</label>
-                    <textarea 
-                      value={draft.effect} 
-                      rows={2}
-                      onChange={(e) => handleUpdateDraft(idx, 'effect', e.target.value)}
-                      className="w-full bg-gray-900 border border-gray-700 rounded px-3 py-2 text-sm text-gray-300"
-                    />
-                  </div>
-
-                   <div className="md:col-span-12">
-                     <label className="block text-[10px] text-gray-500 uppercase tracking-wider mb-1">Legal Significance (AI Extracted)</label>
-                    <textarea 
-                      value={draft.legalSignificance || ''} 
-                      rows={2}
-                      onChange={(e) => handleUpdateDraft(idx, 'legalSignificance', e.target.value)}
-                      className="w-full bg-indigo-900/20 border border-indigo-500/30 rounded px-3 py-2 text-sm text-indigo-200"
-                      placeholder="Why this matters..."
-                    />
-                  </div>
-
-                  <div className="md:col-span-6">
-                    <label className="block text-[10px] text-gray-500 uppercase tracking-wider mb-1">Legal Claim</label>
-                    <input 
-                      type="text" 
-                      value={draft.claim} 
-                      onChange={(e) => handleUpdateDraft(idx, 'claim', e.target.value)}
-                      className="w-full bg-gray-900 border border-gray-700 rounded px-3 py-2 text-sm text-yellow-500 font-mono"
-                    />
-                  </div>
-                  <div className="md:col-span-6">
-                    <label className="block text-[10px] text-gray-500 uppercase tracking-wider mb-1">Source Citation (Snippet)</label>
-                    <input 
-                      type="text" 
-                      value={draft.sourceCitation || ''} 
-                      onChange={(e) => handleUpdateDraft(idx, 'sourceCitation', e.target.value)}
-                      className="w-full bg-gray-900 border border-gray-700 rounded px-3 py-2 text-xs text-gray-400 italic"
-                    />
-                  </div>
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    <div className="md:col-span-2 flex gap-2">
+                        <input type="text" value={draft.date} onChange={(e) => handleUpdateDraft(idx, 'date', e.target.value)} className="bg-gray-900 border border-gray-700 rounded p-2 text-white w-1/4" placeholder="Date (YYYY-MM-DD)" />
+                        <input type="text" value={draft.actor} onChange={(e) => handleUpdateDraft(idx, 'actor', e.target.value)} className="bg-gray-900 border border-gray-700 rounded p-2 text-orange-400 w-1/4 font-mono text-xs" placeholder="Actor" />
+                        <input type="text" value={draft.title} onChange={(e) => handleUpdateDraft(idx, 'title', e.target.value)} className="bg-gray-900 border border-gray-700 rounded p-2 text-white flex-1 font-bold" placeholder="Title" />
+                    </div>
+                  <textarea value={draft.cause} onChange={(e) => handleUpdateDraft(idx, 'cause', e.target.value)} className="bg-gray-900 border border-gray-700 rounded p-2 text-gray-300 text-sm" placeholder="Cause" rows={2} />
+                  <textarea value={draft.effect} onChange={(e) => handleUpdateDraft(idx, 'effect', e.target.value)} className="bg-gray-900 border border-gray-700 rounded p-2 text-gray-300 text-sm" placeholder="Effect" rows={2} />
+                  <textarea value={draft.legalSignificance} onChange={(e) => handleUpdateDraft(idx, 'legalSignificance', e.target.value)} className="md:col-span-2 bg-indigo-900/20 border border-indigo-500/30 rounded p-2 text-indigo-200 text-sm" placeholder="Legal Significance" rows={2} />
+                  <input type="text" value={draft.caseReference} onChange={(e) => handleUpdateDraft(idx, 'caseReference', e.target.value)} className="bg-gray-900 border border-gray-700 rounded p-2 text-gray-300 text-sm" placeholder="Case Ref" />
+                  <input type="text" value={draft.sourceCitation} onChange={(e) => handleUpdateDraft(idx, 'sourceCitation', e.target.value)} className="bg-gray-900 border border-gray-700 rounded p-2 text-gray-400 italic text-sm" placeholder="Citation / Timestamp" />
                 </div>
               </div>
             ))}
             </div>
           )}
 
-          <div className="flex justify-end pt-4 border-t border-gray-700 sticky bottom-0 bg-gray-900/90 p-4 backdrop-blur-sm -mx-6 -mb-6 rounded-b-lg">
+          <div className="flex justify-end pt-4 border-t border-gray-700 sticky bottom-0 bg-gray-900/90 p-4 rounded-b-lg">
             <button
               onClick={handleCommit}
-              disabled={parsedDrafts.length === 0}
-              className="bg-yellow-500 text-gray-900 px-8 py-3 rounded-md font-bold hover:bg-yellow-400 shadow-lg transition-all flex items-center disabled:opacity-50 disabled:cursor-not-allowed"
+              disabled={hasPendingClarifications || parsedDrafts.length === 0}
+              className="bg-yellow-500 text-gray-900 px-8 py-3 rounded-md font-bold hover:bg-yellow-400 disabled:opacity-50 disabled:cursor-not-allowed transition-all shadow-lg transform active:scale-95"
             >
-              <svg className="w-5 h-5 mr-2" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" /></svg>
-              Commit to Timeline
+              {hasPendingClarifications ? "Resolve Clarifications to Commit" : `Commit ${parsedDrafts.length} Events`}
             </button>
           </div>
         </div>

@@ -19,7 +19,7 @@ const PrintableReport: React.FC<PrintableReportProps> = ({ sections, timelineDat
   };
   
   return (
-    <div className="printable-report bg-white text-black p-8 font-serif" style={{ display: 'none' }}>
+    <div className="printable-report bg-white text-black p-8 font-serif">
       <header className="text-center border-b-2 border-black pb-4 mb-8">
         <h1 className="text-4xl font-bold">Judicial Timeline Report</h1>
         <p className="text-lg mt-2">Case No. 3:24-cv-00579-ART-CSD</p>
@@ -70,7 +70,7 @@ const PrintableReport: React.FC<PrintableReportProps> = ({ sections, timelineDat
               </div>
               <div className="bg-gray-100 p-4 border border-gray-300 text-xs font-mono">
                 <pre className="whitespace-pre-wrap">
-                  <code>{renderOcrContent(doc.content)}</code>
+                  <code>{renderOcrContent(doc.content || 'Content not loaded in report view (Lazy Loaded)')}</code>
                 </pre>
               </div>
             </div>

@@ -1,9 +1,8 @@
-
 import React, { useState, useEffect, useRef } from 'react';
 import type { TimelineEvent } from '../types';
 
 const CalendarIcon: React.FC<React.SVGProps<SVGSVGElement>> = (props) => (
-  <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" {...props}>
+  <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" {...props}>
     <rect x="3" y="4" width="18" height="18" rx="2" ry="2"></rect>
     <line x1="16" y1="2" x2="16" y2="6"></line>
     <line x1="8" y1="2" x2="8" y2="6"></line>
@@ -11,14 +10,8 @@ const CalendarIcon: React.FC<React.SVGProps<SVGSVGElement>> = (props) => (
   </svg>
 );
 
-const ChevronDownIcon: React.FC<React.SVGProps<SVGSVGElement>> = (props) => (
-  <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" {...props}>
-    <polyline points="6 9 12 15 18 9"></polyline>
-  </svg>
-);
-
 const ScaleIcon: React.FC<React.SVGProps<SVGSVGElement>> = (props) => (
-    <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" {...props}>
+    <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" {...props}>
         <path d="m16 16 3-8 3 8c-.87.65-1.92 1-3 1s-2.13-.35-3-1Z"/>
         <path d="m2 16 3-8 3 8c-.87.65-1.92 1-3 1s-2.13-.35-3-1Z"/>
         <path d="M7 21h10"/>
@@ -27,26 +20,45 @@ const ScaleIcon: React.FC<React.SVGProps<SVGSVGElement>> = (props) => (
     </svg>
 );
 
+const TargetIcon: React.FC<React.SVGProps<SVGSVGElement>> = (props) => (
+    <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" {...props}>
+      <circle cx="12" cy="12" r="10"></circle>
+      <line x1="22" y1="12" x2="18" y2="12"></line>
+      <line x1="6" y1="12" x2="2" y2="12"></line>
+      <line x1="12" y1="6" x2="12" y2="2"></line>
+      <line x1="12" y1="22" x2="12" y2="18"></line>
+    </svg>
+);
+
 interface TimelineItemProps {
   event: TimelineEvent;
   isLast: boolean;
   isPrinting?: boolean;
-  onViewDocument?: (docId: string, citation?: string) => void;
+  onViewDocument?: (docId: string, citation?: string, anchor?: string) => void;
   highlighted?: boolean;
+  isSelected?: boolean;
+  onToggleSelection?: (eventId: string) => void;
 }
 
-const DetailRow: React.FC<{ label: string; content: string }> = ({ label, content }) => (
-  <div className="grid grid-cols-1 md:grid-cols-4 gap-2 py-3 border-b border-gray-700/50">
-    <dt className="font-semibold text-sm text-yellow-400">{label}:</dt>
-    <dd className="md:col-span-3 text-sm text-gray-300">{content}</dd>
+const DetailRow: React.FC<{ label: string; content: string; color?: string }> = ({ label, content, color = "text-cyan-600" }) => (
+  <div className="grid grid-cols-1 md:grid-cols-4 gap-2 py-2 border-b border-slate-800/50 last:border-0">
+    <dt className={`font-mono text-xs ${color} uppercase tracking-wider`}>{label}:</dt>
+    <dd className="md:col-span-3 text-sm text-gray-300 font-mono">{content}</dd>
   </div>
 );
 
-const TimelineItem: React.FC<TimelineItemProps> = ({ event, isLast, isPrinting = false, onViewDocument, highlighted = false }) => {
+const TimelineItem: React.FC<TimelineItemProps> = ({ 
+    event, 
+    isLast, 
+    isPrinting = false, 
+    onViewDocument, 
+    highlighted = false,
+    isSelected = false,
+    onToggleSelection
+}) => {
   const [isExpanded, setIsExpanded] = useState(isPrinting);
   const itemRef = useRef<HTMLDivElement>(null);
 
-  // Auto-scroll and glow effect when highlighted
   useEffect(() => {
     if (highlighted && itemRef.current) {
         setIsExpanded(true);
@@ -54,66 +66,117 @@ const TimelineItem: React.FC<TimelineItemProps> = ({ event, isLast, isPrinting =
     }
   }, [highlighted]);
 
+  const isMediaEvent = /^\d{1,2}:\d{2}/.test(event.sourceCitation || '');
+
   return (
-    <div className="relative mb-8" style={{ breakInside: 'avoid' }} ref={itemRef}>
-      <div className={`absolute -left-[34px] top-1 h-6 w-6 rounded-full flex items-center justify-center ring-8 ring-gray-900 transition-colors duration-500 ${highlighted ? 'bg-indigo-500 animate-pulse' : 'bg-yellow-400'}`}>
-        <div className="h-3 w-3 bg-gray-900 rounded-full"></div>
-      </div>
+    <div className="relative mb-6" style={{ breakInside: 'avoid' }} ref={itemRef}>
+      {/* Connector Line */}
+      {!isLast && !isPrinting && (
+        <div className="absolute left-[-29px] top-6 bottom-[-24px] w-px bg-slate-800"></div>
+      )}
+
+      {/* Node Marker */}
+      <div className={`absolute -left-[33px] top-1.5 h-2.5 w-2.5 rotate-45 border transition-all duration-500 z-10 ${
+          isSelected ? 'bg-red-500 border-red-400 shadow-[0_0_15px_red] scale-125' :
+          highlighted ? 'bg-cyan-500 border-cyan-400 shadow-[0_0_10px_rgba(6,182,212,0.8)]' : 
+          isMediaEvent ? 'bg-black border-red-500' : 
+          'bg-black border-cyan-700'
+      }`}></div>
       
-      <div className={`ml-4 bg-gray-800 border rounded-lg shadow-lg overflow-hidden transition-all duration-500 ${highlighted ? 'border-indigo-500 ring-2 ring-indigo-500/50' : 'border-gray-700'}`}>
+      {/* Event Card */}
+      <div className={`ml-4 glass-panel rounded-sm overflow-hidden transition-all duration-300 ${
+          isSelected ? 'border-l-4 border-l-red-500 bg-red-950/10 shadow-[0_0_20px_rgba(220,38,38,0.1)]' :
+          highlighted ? 'border-l-4 border-l-cyan-400 shadow-[0_0_20px_rgba(6,182,212,0.1)]' : 
+          'border-l-2 border-l-slate-700 hover:border-l-cyan-600'
+      }`}>
         <div 
-          className="p-4" 
+          className="p-3 cursor-pointer group"
           onClick={() => !isPrinting && setIsExpanded(!isExpanded)}
-          style={{ cursor: isPrinting ? 'default' : 'pointer' }}
-          aria-expanded={isExpanded}
         >
-          <div className="flex justify-between items-start">
-            <div>
-              <time className="mb-1 text-sm font-normal leading-none text-gray-400 flex items-center">
-                <CalendarIcon className="w-4 h-4 mr-2" />
-                {event.date}
-              </time>
-              <h3 className="text-lg font-semibold text-gray-100">{event.title}</h3>
-              {/* Source Badge Link */}
-              {event.sourceId && (
-                  <button 
-                    onClick={(e) => {
-                        e.stopPropagation();
-                        if (onViewDocument) onViewDocument(event.sourceId || '', event.sourceCitation);
-                    }}
-                    className="mt-2 inline-flex items-center gap-1 text-[10px] bg-gray-700 hover:bg-gray-600 hover:text-white text-gray-300 px-2 py-0.5 rounded border border-gray-600 transition-colors z-10 relative"
-                  >
-                      <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13.828 10.172a4 4 0 00-5.656 0l-4 4a4 4 0 105.656 5.656l1.102-1.101m-.758-4.899a4 4 0 005.656 0l4-4a4 4 0 00-5.656-5.656l-1.1 1.1" /></svg>
-                      View Source {event.sourceCitation && "(Jump to Text)"}
-                  </button>
-              )}
+          <div className="flex justify-between items-start gap-4">
+            <div className="flex-1">
+              <div className="flex items-center gap-3 mb-1">
+                  <span className="font-mono text-xs text-cyan-500 flex items-center bg-cyan-950/30 px-2 py-0.5 rounded-sm border border-cyan-900/50">
+                    <CalendarIcon className="w-3 h-3 mr-2" />
+                    {event.date}
+                  </span>
+                  {event.caseReference && (
+                    <span className="font-mono text-[10px] text-gray-500 border border-slate-700 px-1 rounded-sm">
+                        {event.caseReference}
+                    </span>
+                  )}
+                  {event.actor && (
+                    <span className="font-mono text-[9px] text-orange-400 uppercase tracking-tighter border border-orange-900 bg-orange-950/20 px-1 rounded-sm">
+                        {event.actor}
+                    </span>
+                  )}
+              </div>
+              <h3 className={`text-base font-bold font-hud transition-colors ${isSelected ? 'text-red-400' : 'text-gray-100 group-hover:text-cyan-300'}`}>
+                {event.title}
+              </h3>
+              
+              <div className="flex items-center gap-4 mt-2">
+                 {/* Targeting Button */}
+                 {!isPrinting && onToggleSelection && (
+                    <button
+                        onClick={(e) => {
+                            e.stopPropagation();
+                            onToggleSelection(event.id);
+                        }}
+                        className={`text-[10px] font-mono uppercase font-bold flex items-center gap-1 transition-all ${
+                            isSelected ? 'text-red-400 animate-pulse' : 'text-gray-600 hover:text-red-400'
+                        }`}
+                    >
+                        <TargetIcon className="w-3 h-3" />
+                        <span>{isSelected ? 'TARGET LOCKED' : 'TARGET'}</span>
+                    </button>
+                 )}
+
+                 {/* Source Link */}
+                 {event.sourceId && (
+                      <button 
+                        onClick={(e) => {
+                            e.stopPropagation();
+                            if (onViewDocument) onViewDocument(event.sourceId || '', event.sourceCitation, event.snippetAnchor);
+                        }}
+                        className="text-[10px] font-mono uppercase text-gray-500 hover:text-white flex items-center gap-1 transition-colors"
+                      >
+                          <span>[ VIEW SOURCE ]</span>
+                      </button>
+                 )}
+              </div>
             </div>
-            {!isPrinting && <ChevronDownIcon className={`w-6 h-6 text-gray-400 transition-transform duration-300 ${isExpanded ? 'rotate-180' : ''}`} />}
+            
+            {/* Expansion Indicator */}
+             <div className={`text-cyan-900 transition-transform duration-300 ${isExpanded ? 'rotate-180 text-cyan-500' : ''}`}>
+                 ▼
+             </div>
           </div>
         </div>
 
         {isExpanded && (
-          <div className="bg-gray-800/50 p-4 border-t border-gray-700">
+          <div className="bg-black/40 p-4 border-t border-slate-800">
             {event.legalSignificance && (
-                 <div className="mb-4 bg-indigo-900/20 p-3 rounded border border-indigo-500/30">
+                 <div className="mb-4 bg-slate-900/80 p-3 rounded-sm border-l-2 border-indigo-500">
                      <div className="flex items-center gap-2 mb-1">
-                         <ScaleIcon className="w-4 h-4 text-indigo-400" />
-                         <span className="text-xs font-bold text-indigo-300 uppercase tracking-widest">Legal Significance</span>
+                         <ScaleIcon className="w-3 h-3 text-indigo-400" />
+                         <span className="text-[10px] font-bold text-indigo-400 uppercase tracking-widest font-mono">Legal Significance</span>
                      </div>
-                     <p className="text-sm text-indigo-100 leading-relaxed">{event.legalSignificance}</p>
+                     <p className="text-xs text-indigo-100 font-mono leading-relaxed">{event.legalSignificance}</p>
                  </div>
             )}
             
-            <dl>
-              <DetailRow label="Cause" content={event.cause} />
-              <DetailRow label="Effect" content={event.effect} />
-              <DetailRow label="§ 1983 Claim" content={event.claim} />
+            <dl className="space-y-1">
+              {event.actor && <DetailRow label="ACTOR" content={event.actor} color="text-orange-500" />}
+              <DetailRow label="CAUSE" content={event.cause} />
+              <DetailRow label="EFFECT" content={event.effect} />
+              <DetailRow label="CLAIM" content={event.claim} />
               
               {event.citations && event.citations.length > 0 && (
-                <div className="grid grid-cols-1 md:grid-cols-4 gap-2 py-3 border-b border-gray-700/50">
-                    <dt className="font-semibold text-sm text-yellow-400">Authorities:</dt>
+                <div className="grid grid-cols-1 md:grid-cols-4 gap-2 py-2 border-b border-slate-800/50">
+                    <dt className="font-mono text-xs text-cyan-600 uppercase tracking-wider">Auth:</dt>
                     <dd className="md:col-span-3 text-sm text-gray-300">
-                        <ul className="list-disc ml-4 space-y-1">
+                        <ul className="list-disc ml-4 space-y-1 text-xs font-mono text-yellow-500">
                             {event.citations.map((cite, i) => (
                                 <li key={i}>{cite}</li>
                             ))}
@@ -121,17 +184,10 @@ const TimelineItem: React.FC<TimelineItemProps> = ({ event, isLast, isPrinting =
                     </dd>
                 </div>
               )}
-              
-              {event.sourceCitation && (
-                <div className="grid grid-cols-1 md:grid-cols-4 gap-2 py-3 border-b border-gray-700/50 bg-gray-900/30 -mx-4 px-4">
-                    <dt className="font-semibold text-sm text-gray-500 uppercase tracking-wider">Evidentiary Proof:</dt>
-                    <dd className="md:col-span-3 text-xs text-gray-400 italic font-serif">"{event.sourceCitation}"</dd>
-                </div>
-              )}
 
-              <div className="grid grid-cols-1 md:grid-cols-4 gap-2 py-3">
-                <dt className="font-semibold text-sm text-yellow-400">Relief Sought:</dt>
-                <dd className="md:col-span-3 text-sm text-gray-300">{event.relief}</dd>
+              <div className="grid grid-cols-1 md:grid-cols-4 gap-2 py-2">
+                <dt className="font-mono text-xs text-cyan-600 uppercase tracking-wider">Relief:</dt>
+                <dd className="md:col-span-3 text-xs text-gray-400 font-mono">{event.relief}</dd>
               </div>
             </dl>
           </div>

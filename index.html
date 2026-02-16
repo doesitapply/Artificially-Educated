@@ -4,37 +4,92 @@
   <meta charset="UTF-8" />
   <link rel="icon" type="image/svg+xml" href="/vite.svg" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Judicial Timeline Report</title>
+  <title>Project MANUS | Forensic Engine</title>
   <script src="https://cdn.tailwindcss.com"></script>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Roboto+Slab:wght@400;700&display=swap" rel="stylesheet">
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Orbitron:wght@400;700;900&family=Inter:wght@400;600&display=swap" rel="stylesheet">
   <style>
+    :root {
+      --cyan-glow: 0 0 10px rgba(6, 182, 212, 0.5);
+      --red-glow: 0 0 10px rgba(220, 38, 38, 0.5);
+    }
     body {
-      font-family: 'Inter', sans-serif;
+      font-family: 'JetBrains Mono', monospace;
+      background-color: #020617; /* Slate 950 */
+      color: #e2e8f0;
+      overflow-x: hidden;
     }
-    .font-serif {
-      font-family: 'Roboto Slab', serif;
+    .font-hud {
+      font-family: 'Orbitron', sans-serif;
     }
+    .font-mono {
+      font-family: 'JetBrains Mono', monospace;
+    }
+    
+    /* Tactical Background Grid */
+    .bg-grid {
+      background-image: 
+        linear-gradient(to right, rgba(30, 41, 59, 0.3) 1px, transparent 1px),
+        linear-gradient(to bottom, rgba(30, 41, 59, 0.3) 1px, transparent 1px);
+      background-size: 40px 40px;
+    }
+    
+    /* CRT Scanline Effect */
+    .scanlines::before {
+      content: " ";
+      display: block;
+      position: fixed;
+      top: 0;
+      left: 0;
+      bottom: 0;
+      right: 0;
+      background: linear-gradient(rgba(18, 16, 16, 0) 50%, rgba(0, 0, 0, 0.25) 50%), linear-gradient(90deg, rgba(255, 0, 0, 0.06), rgba(0, 255, 0, 0.02), rgba(0, 0, 255, 0.06));
+      z-index: 9999;
+      background-size: 100% 2px, 3px 100%;
+      pointer-events: none;
+    }
+
+    /* Scrollbar */
+    ::-webkit-scrollbar {
+      width: 8px;
+      height: 8px;
+    }
+    ::-webkit-scrollbar-track {
+      background: #0f172a; 
+    }
+    ::-webkit-scrollbar-thumb {
+      background: #334155; 
+      border: 1px solid #1e293b;
+    }
+    ::-webkit-scrollbar-thumb:hover {
+      background: #475569; 
+    }
+
+    /* Utilities */
+    .glass-panel {
+      background: rgba(15, 23, 42, 0.7);
+      backdrop-filter: blur(8px);
+      border: 1px solid rgba(51, 65, 85, 0.5);
+    }
+    .border-glow {
+      box-shadow: 0 0 5px rgba(56, 189, 248, 0.2);
+    }
+    
+    .recharts-cartesian-grid-horizontal line,
+    .recharts-cartesian-grid-vertical line {
+      stroke: #1e293b;
+    }
+    
     @media print {
       body {
         background-color: #ffffff !important;
         color: #000000 !important;
-        font-family: 'Roboto Slab', serif;
+        font-family: 'Times New Roman', serif;
       }
-
-      #app-container {
-        display: none;
-      }
-
-      .printable-report {
-        display: block;
-      }
-      
-      @page {
-        size: letter;
-        margin: 0.75in;
-      }
+      .bg-grid, .scanlines::before { display: none; }
+      #app-container { display: none; }
+      .printable-report { display: block; }
     }
   </style>
 <script type="importmap">
@@ -43,13 +98,14 @@
     "react/": "https://aistudiocdn.com/react@^19.1.1/",
     "react": "https://aistudiocdn.com/react@^19.1.1",
     "react-dom/": "https://aistudiocdn.com/react-dom@^19.1.1/",
-    "@google/genai": "https://aistudiocdn.com/@google/genai@^1.30.0"
+    "@google/genai": "https://aistudiocdn.com/@google/genai@^1.30.0",
+    "recharts": "https://cdn.jsdelivr.net/npm/recharts@2.12.7/+esm"
   }
 }
 </script>
 </head>
-<body class="bg-gray-900 text-gray-300">
-  <div id="root"></div>
+<body class="bg-black text-gray-300 scanlines">
+  <div id="root" class="bg-grid min-h-screen"></div>
   <script type="module" src="/index.tsx"></script>
 </body>
 </html>
